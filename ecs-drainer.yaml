@@ -1,0 +1,113 @@
+Parameters:
+
+  ECSCluster:
+    Type: String
+
+  AutoScalingGroup:
+    Type: String
+
+Resources:
+  DrainInstancesLifecycleHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      LifecycleTransition: "autoscaling:EC2_INSTANCE_TERMINATING"
+      HeartbeatTimeout: "600"
+      DefaultResult: "ABANDON"
+      NotificationMetadata: !Sub "{\"ecsCluster\": \"${ECSCluster}\"}"
+
+  DrainerLambdaExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Policies:
+        - PolicyName: "lambda-inline"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - autoscaling:CompleteLifecycleAction
+                  - ecs:*
+                Resource: "*"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AutoScalingNotificationAccessRole
+      Path: "/"
+
+  DrainerLambdaFunction:
+    Type: "AWS::Lambda::Function"
+    Properties:
+      Handler: "index.lambda_handler"
+      Role: !GetAtt DrainerLambdaExecutionRole.Arn
+      Runtime: "python2.7"
+      Timeout: "300"
+      Code:
+        ZipFile: |
+          import boto3
+
+          session = boto3.session.Session()
+          ecs = session.client('ecs')
+          asg = session.client('autoscaling')
+
+          def lambda_handler(event, context):
+              print(event)
+              clusterName = event['NotificationMetadata']['ecsCluster']
+              Ec2InstanceId = event['EC2InstanceId']
+
+              containerInstanceArns = ecs.list_container_instances(cluster=clusterName)['containerInstanceArns']
+
+              for containerInstance in ecs.describe_container_instances(cluster=clusterName, containerInstances=containerInstanceArns)['containerInstances']:
+                  if containerInstance['ec2InstanceId'] == Ec2InstanceId:
+                      if containerInstance['status'] != 'DRAINING':
+                          ecs.update_container_instances_state(
+                              cluster=clusterName,
+                              containerInstances=[containerInstance['containerInstanceArn']],
+                              status='DRAINING'
+                          )
+
+                      if containerInstance['runningTasksCount'] > 0:
+                          raise Exception("There are still %d running task(s) on %s" % (containerInstance['runningTasksCount'], Ec2InstanceId))
+
+              asg.complete_lifecycle_action(
+                  LifecycleHookName=event['LifecycleHookName'],
+                  AutoScalingGroupName=event['AutoScalingGroupName'],
+                  LifecycleActionToken=event['LifecycleActionToken'],
+                  LifecycleActionResult='CONTINUE',
+                  InstanceId=Ec2InstanceId
+              )
+
+  DrainEventRule:
+    Type: "AWS::Events::Rule"
+    Properties:
+      Description: "EventRule"
+      EventPattern:
+        source:
+          - "aws.autoscaling"
+        detail-type:
+          - "EC2 Instance-terminate Lifecycle Action"
+        detail:
+          AutoScalingGroupName:
+            - !Ref AutoScalingGroup
+      Targets:
+        - Id: "TargetFunction"
+          Arn: !GetAtt DrainerLambdaFunction.Arn
+          InputPath: "$.detail"
+
+  PermissionForEventsToInvokeLambda:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref DrainerLambdaFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt DrainEventRule.Arn
