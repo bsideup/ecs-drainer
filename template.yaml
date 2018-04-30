@@ -55,6 +55,7 @@ Resources:
       Code:
         ZipFile: |
           import boto3
+          from time import sleep
 
           session = boto3.session.Session()
           ecs = session.client('ecs')
@@ -65,19 +66,25 @@ Resources:
               clusterName = event['NotificationMetadata']['ecsCluster']
               Ec2InstanceId = event['EC2InstanceId']
 
-              containerInstanceArns = ecs.list_container_instances(cluster=clusterName)['containerInstanceArns']
+              for i in range(60, 0, -1):
+                  containerInstanceArns = ecs.list_container_instances(cluster=clusterName)['containerInstanceArns']
 
-              for containerInstance in ecs.describe_container_instances(cluster=clusterName, containerInstances=containerInstanceArns)['containerInstances']:
-                  if containerInstance['ec2InstanceId'] == Ec2InstanceId:
-                      if containerInstance['status'] != 'DRAINING':
-                          ecs.update_container_instances_state(
-                              cluster=clusterName,
-                              containerInstances=[containerInstance['containerInstanceArn']],
-                              status='DRAINING'
-                          )
+                  for containerInstance in ecs.describe_container_instances(cluster=clusterName, containerInstances=containerInstanceArns)['containerInstances']:
+                      if containerInstance['ec2InstanceId'] == Ec2InstanceId:
+                          if containerInstance['status'] != 'DRAINING':
+                              ecs.update_container_instances_state(
+                                  cluster=clusterName,
+                                  containerInstances=[containerInstance['containerInstanceArn']],
+                                  status='DRAINING'
+                              )
 
-                      if containerInstance['runningTasksCount'] > 0:
-                          raise Exception("There are still %d running task(s) on %s" % (containerInstance['runningTasksCount'], Ec2InstanceId))
+                          if containerInstance['runningTasksCount'] > 0:
+                              message = "There are still %d running task(s) on %s" % (containerInstance['runningTasksCount'], Ec2InstanceId)
+                              if (i > 1):
+                                  print(message)
+                                  sleep(5)
+                              else:
+                                  raise Exception(message)
 
               asg.complete_lifecycle_action(
                   LifecycleHookName=event['LifecycleHookName'],
